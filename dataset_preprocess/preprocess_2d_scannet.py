@@ -24,8 +24,8 @@ parser.add_argument('--label_type', default='label-filt', help='which labels (la
 parser.add_argument('--frame_skip', type=int, default=1, help='export every nth frame')
 parser.add_argument('--label_map_file', default='',
                     help='path to scannetv2-labels.combined.tsv (required for label export only)')
-parser.add_argument('--output_image_width', type=int, default=320, help='export image width')
-parser.add_argument('--output_image_height', type=int, default=240, help='export image height')
+parser.add_argument('--output_image_width', type=int, default=640, help='export image width')
+parser.add_argument('--output_image_height', type=int, default=480, help='export image height')
 
 parser.set_defaults(export_label_images=False)
 opt = parser.parse_args()
@@ -65,6 +65,8 @@ def read_label_mapping(filename, label_from='raw_category', label_to='nyu40id'):
 
 
 def main():
+    image_size = [opt.output_image_height, opt.output_image_width]
+
     if not os.path.exists(opt.output_path):
         os.makedirs(opt.output_path)
 
@@ -73,15 +75,19 @@ def main():
         label_map = read_label_mapping(opt.label_map_file, label_from='id', label_to='nyu40id')
 
     # save the global intrinsic parameters of resized images
-    img_dim = (320, 240)
-    original_img_dim = (640, 480)
+    image_dim = (image_size[1], image_size[0])
+    intrinsic_image_dim = (640, 480)
     intrinsics = make_intrinsic(fx=577.870605, fy=577.870605, mx=319.5, my=239.5)
-    intrinsics = adjust_intrinsic(intrinsics, original_img_dim, img_dim)
+    intrinsics = adjust_intrinsic(intrinsics, intrinsic_image_dim, image_dim)
     np.savetxt(os.path.join(opt.output_path, 'intrinsics.txt'), intrinsics)
     
-    scenes = sorted([d for d in os.listdir(opt.scannet_path) if os.path.isdir(os.path.join(opt.scannet_path, d))])
+    scenes = sorted([
+        d for d in os.listdir(opt.scannet_path) 
+        if os.path.isdir(os.path.join(opt.scannet_path, d))
+    ])
+    
     print('Found %d scenes' % len(scenes))
-    for i in range(0,len(scenes)):
+    for i in range(0, len(scenes)):
         sens_file = os.path.join(opt.scannet_path, scenes[i], scenes[i] + '.sens')
         label_path = os.path.join(opt.scannet_path, scenes[i], opt.label_type)
         if opt.export_label_images and not os.path.isdir(label_path):
@@ -115,19 +121,32 @@ def main():
             sd = SensorData(sens_file)
         sys.stdout.write('\r[ %d | %d ] %s\texporting...' % ((i + 1), len(scenes), scenes[i]))
         sys.stdout.flush()
-        sd.export_color_images(output_color_path, image_size=[opt.output_image_height, opt.output_image_width],
-                               frame_skip=opt.frame_skip)
-        sd.export_depth_images(output_depth_path, image_size=[opt.output_image_height, opt.output_image_width],
-                               frame_skip=opt.frame_skip)
-        sd.export_poses(output_pose_path, frame_skip=opt.frame_skip)
+
+        sd.export_color_images(
+            output_color_path,
+            image_size=image_size,
+            frame_skip=opt.frame_skip
+        )
+        sd.export_depth_images(
+            output_depth_path,
+            image_size=image_size,
+            frame_skip=opt.frame_skip
+        )
+        sd.export_poses(
+            output_pose_path,
+            frame_skip=opt.frame_skip
+        )
 
         if opt.export_label_images:
-
             for f in range(0, len(sd.frames), opt.frame_skip):
                 label_file = os.path.join(label_path, str(f) + '.png')
                 image = np.array(imageio.imread(label_file))
-                image = sktf.resize(image, [opt.output_image_height, opt.output_image_width], order=0,
-                                    preserve_range=True)
+                image = sktf.resize(
+                    image,
+                    image_size,
+                    order=0,
+                    preserve_range=True
+                )
                 mapped_image = map_label_image(image, label_map)
                 imageio.imwrite(os.path.join(output_label_path, str(f) + '.png'), mapped_image)
     print('')
