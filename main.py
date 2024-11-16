@@ -19,8 +19,21 @@ from tqdm import tqdm
 from utils.sam_utils import *
 from utils.main_utils import *
 from utils.vis_utils import *
-from segment_anything import sam_model_registry, SamPredictor
+# from segment_anything import sam_model_registry, SamPredictor
 
+sam2 = False
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+except ImportError:
+    sam2 = True
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+# parameters for the run
+# Neggative background - agigns not assigned points to a negative background class
+neg_bg = True
+# Threshold for the score of the point to be assigned to a class
+threshold = .0
 
 # 2D-Guided Prompt Filter:
 def prompt_filter(init_prompt, scene_output_path, npy_path, predictor, args):
@@ -112,7 +125,7 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
     n_points = xyz.shape[0]
 
     # num_ins = keep_idx.shape[0]
-    num_ins = 1
+    num_ins = 2 if neg_bg else 1
     
     pt_score = torch.zeros([n_points, num_ins], device=device)  # All input points have a score
     counter_final = torch.zeros([n_points, num_ins], device=device)
@@ -125,6 +138,9 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
         points_data = torch.from_numpy(np.load(os.path.join(scene_output_path, 'points_npy', npy_file))).to(device)
         iou_preds_data = torch.from_numpy(np.load(os.path.join(scene_output_path, 'iou_preds_npy', npy_file))).to(device)
         masks_data = torch.from_numpy(np.load(os.path.join(scene_output_path, 'masks_npy', npy_file))).to(device)
+        # Reshape the masks_data to the shape of frame
+        if sam2:
+            masks_data = masks_data.reshape(-1, 480, 640)
         corre_3d_ins_data = torch.from_numpy(np.load(os.path.join(scene_output_path, 'corre_3d_ins_npy', npy_file))).to(device)  # the valid (i.e., has mapped pixels at the current frame) prompt ID  in the original 3D point cloud of initial prompts
         data = MaskData(
                 masks=masks_data,
@@ -142,11 +158,10 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
 
         # keep_mask = torch.isin(data["corre_3d_ins"], keep_idx)  # only keep the mask that has been kept during previous prompt filter process
         # data.filter(keep_mask)
-
         masks_logits = data["masks"]
         masks = masks_logits > 0.
 
-        ins_idx_all = [0]
+        ins_idx_all = [0, 1] if neg_bg else [0]
         # for actual_idx in data["corre_3d_ins"]:  # the actual prompt ID in the original 3D point cloud of initial prompts, \
         #     # for calculating pt_score later (since pt_score is considered on all initial prompts)
         #     ins_idx = torch.where(keep_idx == actual_idx)[0]
@@ -156,11 +171,18 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
         counter_point = mapping[:, 2]   # the found points
         counter_point = counter_point.reshape(-1, 1).repeat(1, num_ins)
         counter_ins = torch.zeros(num_ins, device=device)
-        counter_ins[ins_idx_all] += 1   # the found prompts
+        if neg_bg:
+            counter_ins[ins_idx_all[0]] += 1   # the found prompts
+        else:
+            counter_ins[ins_idx_all] += 1
         counter_ins = counter_ins.reshape(1, -1).repeat(n_points, 1)
         counter_final += (counter_point * counter_ins)
 
-        # caculate the score on mask area:
+        # Add one more layer to the masks, that has ones, if there are no ones in that pixel in all other layers
+        if neg_bg:
+            new_layer = torch.zeros_like(masks)
+            new_layer[~masks.bool()] = 1
+            masks = torch.stack([masks[0], new_layer[0]], dim=0)
         for index, (mask) in enumerate(masks):  # iterate over each mask area segmented by different prompts
             ins_id = ins_idx_all[index]  # get the actual instance id  # ins_idx_al
             mask = mask.int()
@@ -188,11 +210,14 @@ def perform_3dsegmentation(xyz, keep_idx, scene_output_path, npy_path, args):
 
     pt_pred_abs = np.argmax(pt_score_abs, axis=-1)
 
-    low_pt_idx_mean = np.where(max_score <= 0.)[0]  # assign ins_label=-1 (unlabelled) if its score=0 (i.e., no 2D mask assigned)
+    print(max_score)
+    print(max_score.max())
+
+    low_pt_idx_mean = np.where(max_score <= threshold)[0]  # assign ins_label=-1 (unlabelled) if its score=0 (i.e., no 2D mask assigned)
     pt_score_mean[low_pt_idx_mean] = 0.
     pt_pred_mean[low_pt_idx_mean] = -1
 
-    low_pt_idx_abs = np.where(max_score_abs <= 0.)[0]
+    low_pt_idx_abs = np.where(max_score_abs <= threshold)[0]
     pt_score_abs[low_pt_idx_abs] = 0.
     pt_pred_abs[low_pt_idx_abs] = -1
 
@@ -314,9 +339,6 @@ if __name__ == "__main__":
     # Initialize SAM:
     sys.path.append("..")
     device = torch.device(args.device)
-    sam = sam_model_registry[args.model_type](checkpoint=args.sam_checkpoint)
-    sam.to(device=device)
-    predictor = SamPredictor(sam)
 
     print("Start loading SAM segmentations and other meta data ...")
     # Load the initial 3D input prompts (i.e., fps-sampled input points):
@@ -366,8 +388,7 @@ if __name__ == "__main__":
     create_folder(args.pred_path)
     # save the prediction result:
     pred_file = os.path.join(args.pred_path, args.scene_name + '_seg.npy')
-    .save(pred_file, pt_pred)
-np
+    np.save(pred_file, pt_pred)
     args.post_floor = False
     # Post process for perfect floor segmentation:
     if args.post_floor:

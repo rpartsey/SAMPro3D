@@ -16,7 +16,13 @@ import open3d as o3d
 import pointops
 from utils.main_utils import *
 from utils.sam_utils import *
-from segment_anything import sam_model_registry, SamPredictor
+sam2 = False
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+except ImportError:
+    sam2 = True
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
 from tqdm import trange
 
 
@@ -63,25 +69,45 @@ def process_batch(
     ins_idxs: torch.Tensor,
     im_size: Tuple[int, ...],
 ) -> MaskData:
-    transformed_points = predictor.transform.apply_coords_torch(points, im_size)
+    if sam2:
+        transformed_points = predictor._transforms.transform_coords(points, orig_hw=im_size)
+    else:
+        transformed_points = predictor.transform.apply_coords_torch(points, im_size)
     in_points = torch.as_tensor(transformed_points, device=predictor.device)
     in_labels = torch.from_numpy(point_labels).to(device=predictor.device)  
     # torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
 
-    masks, iou_preds, _ = predictor.predict_torch(
-        in_points[None, :, :],
-        in_labels[None, :],
-        multimask_output=False,
-        return_logits=True,
-    )
+    if sam2:
+        masks, iou_preds, _ = predictor.predict(
+            in_points[None, :, :],
+            in_labels[None, :],
+            multimask_output=False,
+            return_logits=True,
+        )
+    else:
+        masks, iou_preds, _ = predictor.predict_torch(
+            in_points[None, :, :],
+            in_labels[None, :],
+            multimask_output=False,
+            return_logits=True,
+        )
+
     
     # Serialize predictions and store in MaskData  
-    data_original = MaskData(
-        masks=masks.flatten(0, 1),
-        iou_preds=iou_preds.flatten(0, 1),
-        points=points, 
-        corre_3d_ins=ins_idxs 
-    )
+    if sam2:
+        data_original = MaskData(
+            masks=masks.reshape(-1),
+            iou_preds=iou_preds.reshape(-1),
+            points=points, 
+            corre_3d_ins=ins_idxs 
+        )
+    else:
+        data_original = MaskData(
+            masks=masks.flatten(0, 1),
+            iou_preds=iou_preds.flatten(0, 1),
+            points=points, 
+            corre_3d_ins=ins_idxs 
+        )
 
     return data_original
     
@@ -124,7 +150,7 @@ def sam_seg(predictor, frame_id_init, frame_id_end, init_prompt, point_labels, a
         #     continue
         
         
-        if os.path.exists(f"{args.data_path}/{args.scene_name}/features"):
+        if os.path.exists(f"{args.data_path}/{args.scene_name}/features") and not sam2:
             # if features are pre-computed, load them
             features = np.load(os.path.join(args.data_path, args.scene_name, 'features', str(frame_id) + '.npy'))
             features = torch.from_numpy(features).to(device=predictor.device)
@@ -149,9 +175,10 @@ def sam_seg(predictor, frame_id_init, frame_id_end, init_prompt, point_labels, a
         #     del batch_data_original
 
         ins_idxs = torch.arange(1).to(device) # override the ins_idxs to 0 for all points
-        data_original = process_batch(predictor, input_point_pos, (point_labels[corre_ins_idx.cpu().numpy()] == 1).astype(np.int32), ins_idxs, predictor.original_size)
+        data_original = process_batch(predictor, input_point_pos, (point_labels[corre_ins_idx.cpu().numpy()] == 1).astype(np.int32), ins_idxs, predictor._orig_hw if sam2 else predictor.original_size)
         
-        predictor.reset_image()
+        if not sam2:
+            predictor.reset_image()
         data_original.to_numpy()
 
         save_file_name = str(frame_id) + ".npy"
@@ -191,10 +218,16 @@ if __name__ == "__main__":
 
     # Initialize SAM:
     device = torch.device(args.device)
-    sam = sam_model_registry[args.model_type](
-        checkpoint=args.sam_checkpoint
-    ).to(device=device)
-    predictor = SamPredictor(sam)
+    if sam2:
+        checkpoint = "./sam2.1_hiera_large.pt"
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
+    else:
+        sam = sam_model_registry[args.model_type](
+            checkpoint=args.sam_checkpoint
+        ).to(device=device)
+        predictor = SamPredictor(sam)
+
     
     # Load all 3D points of the input scene: 
     # scene_xyz, scene_rgb = load_ply(f"{args.data_path}/{args.scene_name}/{args.scene_name}_vh_clean_2.ply")
